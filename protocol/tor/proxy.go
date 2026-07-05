@@ -8,6 +8,7 @@ import (
 	"net"
 
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
@@ -99,7 +100,7 @@ func (l *ProxyListener) acceptLoop() {
 }
 
 func (l *ProxyListener) accept(ctx context.Context, conn *net.TCPConn) error {
-	return socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), l.authenticator, l, nil, M.SocksaddrFromNet(conn.RemoteAddr()), nil)
+	return socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), l.authenticator, l, nil, C.UDPTimeout, M.SocksaddrFromNet(conn.RemoteAddr()), nil)
 }
 
 func (l *ProxyListener) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {

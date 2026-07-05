@@ -27,6 +27,15 @@ type STDClientConfig struct {
 	fragment              bool
 	fragmentFallbackDelay time.Duration
 	recordFragment        bool
+	handshakeTimeout      time.Duration
+}
+
+func (c *STDClientConfig) HandshakeTimeout() time.Duration {
+	return c.handshakeTimeout
+}
+
+func (c *STDClientConfig) SetHandshakeTimeout(timeout time.Duration) {
+	c.handshakeTimeout = timeout
 }
 
 func (c *STDClientConfig) ServerName() string {
@@ -63,6 +72,7 @@ func (c *STDClientConfig) Clone() Config {
 		fragment:              c.fragment,
 		fragmentFallbackDelay: c.fragmentFallbackDelay,
 		recordFragment:        c.recordFragment,
+		handshakeTimeout:      c.handshakeTimeout,
 	}
 }
 
@@ -198,7 +208,7 @@ func NewSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 	} else if len(clientCertificate) > 0 || len(clientKey) > 0 {
 		return nil, E.New("client certificate and client key must be provided together")
 	}
-	var config Config = &STDClientConfig{ctx, &tlsConfig, options.Fragment, time.Duration(options.FragmentFallbackDelay), options.RecordFragment}
+	var config Config = &STDClientConfig{ctx, &tlsConfig, options.Fragment, time.Duration(options.FragmentFallbackDelay), options.RecordFragment, 0}
 	if options.ECH != nil && options.ECH.Enabled {
 		var err error
 		config, err = parseECHClientConfig(ctx, config.(ECHCapableConfig), options)
