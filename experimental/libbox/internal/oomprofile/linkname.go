@@ -39,8 +39,9 @@ func runtimeFrameSymbolName(f *runtime.Frame) string
 //go:linkname runtimeExpandFinalInlineFrame runtime/pprof.runtime_expandFinalInlineFrame
 func runtimeExpandFinalInlineFrame(stk []uintptr) []uintptr
 
-//go:linkname stdParseProcSelfMaps runtime/pprof.parseProcSelfMaps
-func stdParseProcSelfMaps(data []byte, addMapping func(lo uint64, hi uint64, offset uint64, file string, buildID string))
-
-//go:linkname stdELFBuildID runtime/pprof.elfBuildID
-func stdELFBuildID(file string) (string, error)
+// Neither runtime/pprof.parseProcSelfMaps nor runtime/pprof.elfBuildID has a matching
+// go:linkname push marker in this Go version's runtime/pprof, so pulling them (as this file
+// used to, via stdParseProcSelfMaps/stdELFBuildID declarations) fails at link time
+// ("invalid reference to runtime/pprof.parseProcSelfMaps" / "...elfBuildID"). Both are small,
+// self-contained (ELF-note parsing / /proc/self/maps parsing), so mapping_linux.go vendors
+// them locally (as parseProcSelfMaps and elfBuildID) instead of linknaming them.
