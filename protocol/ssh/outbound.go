@@ -280,5 +280,5 @@ func (s *Outbound) ProxyDisplayName() string {
 			str += " ⚠️ Connecting..."
 		}
 	}
-	return s.connectionErr
+	return str
 }
