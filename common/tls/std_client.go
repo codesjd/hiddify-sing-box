@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"net"
 	"os"
 	"strings"
@@ -141,6 +142,15 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 		tlsConfig.InsecureSkipVerify = true
 		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 			return VerifyPublicKeySHA256(options.CertificatePublicKeySHA256, rawCerts)
+		}
+	}
+	if len(options.PinnedPeerCertificateSha256) > 0 { //H
+		if len(options.Certificate) > 0 || options.CertificatePath != "" {
+			return nil, E.New("pinned_peer_certificate_sha256 is conflict with certificate or certificate_path")
+		}
+		tlsConfig.InsecureSkipVerify = true
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			return VerifyPinnedCertificateSha256(options.PinnedPeerCertificateSha256, rawCerts)
 		}
 	}
 	if len(options.ALPN) > 0 {
@@ -304,4 +314,24 @@ func VerifyPublicKeySHA256(knownHashValues [][]byte, rawCerts [][]byte) error {
 		}
 	}
 	return E.New("unrecognized remote public key: ", base64.StdEncoding.EncodeToString(hashValue[:]))
+}
+
+// VerifyPinnedCertificateSha256 pins against the SHA-256 of the full leaf certificate DER, matching
+// Xray-core's pinnedPeerCertificateChainSha256/pcs semantics (as opposed to VerifyPublicKeySHA256 above,
+// which only hashes the SPKI and is not compatible with hashes computed that way). //H
+func VerifyPinnedCertificateSha256(knownHexHashValues []string, rawCerts [][]byte) error {
+	if len(rawCerts) == 0 {
+		return E.New("no peer certificate presented")
+	}
+	hashValue := sha256.Sum256(rawCerts[0])
+	for _, knownHex := range knownHexHashValues {
+		knownHash, err := hex.DecodeString(strings.TrimSpace(knownHex))
+		if err != nil || len(knownHash) != len(hashValue) {
+			continue
+		}
+		if bytes.Equal(knownHash, hashValue[:]) {
+			return nil
+		}
+	}
+	return E.New("unrecognized remote certificate: ", hex.EncodeToString(hashValue[:]))
 }
