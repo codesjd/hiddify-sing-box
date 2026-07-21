@@ -3,7 +3,9 @@ package xray
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -50,6 +52,50 @@ import (
 	_ "github.com/xtls/xray-core/transport/internet/udp"
 	_ "github.com/xtls/xray-core/transport/internet/websocket"
 )
+
+// normalizeRangeObjects rewrites every {"from": N, "to": M} object anywhere in a decoded JSON
+// tree into the "N-M" string form (or a plain "N" when N == M) that xray-core's own JSON schema
+// actually accepts for its Int32Range-typed fields (xhttp's xPaddingBytes/scMaxEachPostBytes/
+// scMinPostsIntervalMs/scStreamUpServerSecs, xmux's maxConcurrency/maxConnections/cMaxReuseTimes/
+// hMaxRequestTimes/hMaxReusableSecs, etc). xray-core's infra/conf.Int32Range.UnmarshalJSON only
+// understands a plain integer or a "1-2" string; some panels (including hiddify-manager) instead
+// emit the range as an object, which fails with "Invalid integer range..." if handed to xray-core
+// unmodified. No field in xray-core's schema legitimately uses literal "from"/"to" keys for
+// anything else, so this transform is unambiguous wherever it fires - including inside nested
+// "extra"/"downloadSettings" blocks, which is why it walks the whole tree rather than only the
+// known field names.
+func normalizeRangeObjects(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		if len(val) == 2 {
+			from, hasFrom := val["from"]
+			to, hasTo := val["to"]
+			if hasFrom && hasTo {
+				if fromNum, ok := from.(float64); ok {
+					if toNum, ok := to.(float64); ok {
+						if fromNum == toNum {
+							return strconv.FormatInt(int64(fromNum), 10)
+						}
+						return fmt.Sprintf("%d-%d", int64(fromNum), int64(toNum))
+					}
+				}
+			}
+		}
+		out := make(map[string]any, len(val))
+		for k, item := range val {
+			out[k] = normalizeRangeObjects(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(val))
+		for i, item := range val {
+			out[i] = normalizeRangeObjects(item)
+		}
+		return out
+	default:
+		return v
+	}
+}
 
 // xrayInternalOutboundTag is the fixed tag used inside the embedded, single-outbound xray-core
 // instance. The manager/ray2sing-supplied tag (options.XConfig["tag"]) is discarded and replaced
@@ -105,7 +151,7 @@ func New(ctx context.Context, router adapter.Router, logger log.ContextLogger, t
 		return nil, E.New("xray: no outbound config provided (xconfig or xray_outbound_raw)")
 	}
 
-	rawOutbound, err := json.Marshal(*rawConfig)
+	rawOutbound, err := json.Marshal(normalizeRangeObjects(map[string]any(*rawConfig)))
 	if err != nil {
 		return nil, E.Cause(err, "xray: marshal outbound config")
 	}
