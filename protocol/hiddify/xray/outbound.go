@@ -15,14 +15,14 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 
-	xcore "github.com/xtls/xray-core/core"
-	xconf "github.com/xtls/xray-core/infra/conf"
 	xnet "github.com/xtls/xray-core/common/net"
 	xcnc "github.com/xtls/xray-core/common/net/cnc"
 	xsession "github.com/xtls/xray-core/common/session"
+	xcore "github.com/xtls/xray-core/core"
+	xoutbound "github.com/xtls/xray-core/features/outbound"
+	xconf "github.com/xtls/xray-core/infra/conf"
 	xtransport "github.com/xtls/xray-core/transport"
 	xpipe "github.com/xtls/xray-core/transport/pipe"
-	xoutbound "github.com/xtls/xray-core/features/outbound"
 
 	// Mandatory plumbing: Config.Build() always references these regardless of what the
 	// wrapped outbound actually needs (dispatcher/proxyman are the App entries every
@@ -78,24 +78,39 @@ type Outbound struct {
 // outbound.Handler - bypassing xray-core's own routing/dispatcher entirely, since there is exactly
 // one destination-less outbound and sing-box already decided to route here.
 func New(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.XrayOutboundOptions) (adapter.Outbound, error) {
-	if options.XConfig == nil {
-		return nil, E.New("xray: missing xconfig")
+	// XConfig is the current field; DeprecatedXrayOutboundJson (xray_outbound_raw) is what the
+	// Dart JSON editor's "xray" outbound template still seeds new outbounds with (and what
+	// already-saved profiles on user devices contain), so fall back to it rather than erroring.
+	rawConfig := options.XConfig
+	if rawConfig == nil || len(*rawConfig) == 0 {
+		rawConfig = options.DeprecatedXrayOutboundJson
+	}
+	if rawConfig == nil || len(*rawConfig) == 0 {
+		return nil, E.New("xray: no outbound config provided (xconfig or xray_outbound_raw)")
 	}
 
-	rawOutbound, err := json.Marshal(*options.XConfig)
+	rawOutbound, err := json.Marshal(*rawConfig)
 	if err != nil {
-		return nil, E.Cause(err, "xray: marshal xconfig")
+		return nil, E.Cause(err, "xray: marshal outbound config")
 	}
 
 	var outboundConf xconf.OutboundDetourConfig
 	if err := json.Unmarshal(rawOutbound, &outboundConf); err != nil {
-		return nil, E.Cause(err, "xray: parse xconfig")
+		return nil, E.Cause(err, "xray: parse outbound config")
 	}
 	outboundConf.Tag = xrayInternalOutboundTag
+	if outboundConf.Protocol == "" {
+		return nil, E.New("xray: outbound config is empty (missing protocol)")
+	}
 
-	coreConfig, err := (&xconf.Config{
+	xrayConfig := &xconf.Config{
 		OutboundConfigs: []xconf.OutboundDetourConfig{outboundConf},
-	}).Build()
+	}
+	if logLevel := xrayLogLevel(options); logLevel != "" {
+		xrayConfig.LogConfig = &xconf.LogConfig{LogLevel: logLevel, AccessLog: "none", ErrorLog: "none"}
+	}
+
+	coreConfig, err := xrayConfig.Build()
 	if err != nil {
 		return nil, E.Cause(err, "xray: build config")
 	}
@@ -117,6 +132,14 @@ func New(ctx context.Context, router adapter.Router, logger log.ContextLogger, t
 	if handler == nil {
 		instance.Close()
 		return nil, E.New("xray: outbound handler not registered")
+	}
+
+	if options.DeprecatedFragment != nil {
+		// xray_fragment (the JSON editor's TLS-hello fragment template) has no equivalent
+		// applied by this embedded outbound - DirectXray's dialer/sockopt-based fragment
+		// (ray2sing) is the supported path instead. Warn rather than silently doing nothing
+		// that looks like it should matter.
+		logger.WarnContext(ctx, "xray: xray_fragment is set but not applied by the embedded outbound; ignoring")
 	}
 
 	return &Outbound{
@@ -151,6 +174,18 @@ func (h *Outbound) Close() error {
 		}
 	})
 	return err
+}
+
+// xrayLogLevel resolves the JSON editor's xdebug/xray_loglevel fields into an xray-core log
+// level string, or "" to leave xray-core's own default (warning, console, no access log).
+func xrayLogLevel(options option.XrayOutboundOptions) string {
+	if options.DeprecatedLogLevel != nil && *options.DeprecatedLogLevel != "" {
+		return *options.DeprecatedLogLevel
+	}
+	if options.XDebug {
+		return "debug"
+	}
+	return ""
 }
 
 func withXrayOutboundTarget(ctx context.Context, dest xnet.Destination) context.Context {
