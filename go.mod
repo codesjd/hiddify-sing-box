@@ -4,6 +4,8 @@ go 1.25.6
 
 require github.com/amnezia-vpn/amneziawg-go v0.2.16
 
+require github.com/xtls/xray-core v0.0.0-00010101000000-000000000000
+
 require (
 	github.com/Psiphon-Labs/psiphon-tunnel-core v1.0.11-0.20260126173038-c86a1497a760
 	github.com/anthropics/anthropic-sdk-go v1.26.0
@@ -75,11 +77,22 @@ require (
 )
 
 require (
+	github.com/apernet/quic-go v0.57.2-0.20260111184307-eec823306178 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/juju/ratelimit v1.0.2 // indirect
+	github.com/riobard/go-bloom v0.0.0-20200614022211-cdc8013cb5b3 // indirect
+	github.com/seiflotfy/cuckoofilter v0.0.0-20240715131351-a2f2c23f1771 // indirect
+	github.com/v2fly/ss-bloomring v0.0.0-20210312155135-28617310f63e // indirect
+	github.com/vishvananda/netlink v1.3.1 // indirect
+	github.com/xtls/reality v0.0.0-20251014195629-e4eec4520535 // indirect
+)
+
+require (
 	github.com/AdguardTeam/golibs v0.32.7 // indirect
 	github.com/ameshkov/dnscrypt/v2 v2.4.0
 	github.com/ameshkov/dnsstamps v1.0.3 // indirect
 	github.com/biter777/countries v1.7.5
-	github.com/pires/go-proxyproto v0.8.1
+	github.com/pires/go-proxyproto v0.9.0
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	golang.org/x/sync v0.19.0 // indirect
@@ -113,7 +126,7 @@ require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash v1.1.0 // indirect
 	github.com/cheekybits/genny v0.0.0-20170328200008-9127e812e1e9 // indirect
-	github.com/cloudflare/circl v1.6.1 // indirect
+	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/cognusion/go-cache-lru v0.0.0-20170419142635-f73e2280ecea // indirect
 	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6 // indirect
 	github.com/coreos/go-oidc/v3 v3.17.0 // indirect
@@ -252,11 +265,13 @@ require (
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251202230838-ff82c1b0f217 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	gvisor.dev/gvisor v0.0.0-20231202080848-1f7806d17489 // indirect
+	gvisor.dev/gvisor v0.0.0-20260109181451-4be7c433dae2 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 	tailscale.com v1.58.2 // indirect
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
+
+replace github.com/xtls/xray-core => github.com/hiddify/xray-core v0.0.0-20260124181826-59e6569c13e9
 
 replace github.com/sagernet/sing-dns => github.com/shtorm-7/sing-dns v0.4.6-extended-1.0.0
 
