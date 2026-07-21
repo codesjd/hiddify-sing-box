@@ -230,3 +230,82 @@ func TestObjectFormRangeConfigBuildsRealInstance(t *testing.T) {
 	ob := adapterOutbound.(*Outbound)
 	defer ob.Close()
 }
+
+// TestKcpMtuBelowFloorClampsAndBuilds reproduces the exact "a.onionchips.sbs XDNS" outbound from a
+// real hiddify-manager subscription (pulled from a user's live config export), which sets
+// kcpSettings.mtu to 132 - a deliberately small value since this outbound only ever carries tiny
+// DNS-sized UDP payloads (via the xdns finalmask). xray-core's own infra/conf.KCPConfig.Build()
+// hard-rejects anything under 576 with "invalid mKCP MTU size: 132" - confirmed against both the
+// exact vendored xray-core version and the current github.com/hiddify/xray-core source, so this
+// isn't fixable by changing what JSON we generate, only by adapting what we send before it reaches
+// that check. Without clampKcpMtu, this outbound fails to build at all.
+func TestKcpMtuBelowFloorClampsAndBuilds(t *testing.T) {
+	xconfig := map[string]any{
+		"protocol": "vless",
+		"tag":      "proxy",
+		"settings": map[string]any{
+			"vnext": []any{
+				map[string]any{
+					"address": "8.8.8.8",
+					"port":    float64(53),
+					"users": []any{
+						map[string]any{"id": "6aca7d1d-632c-464f-b8de-f640962d89c7", "encryption": "none", "flow": "", "level": float64(8)},
+					},
+				},
+			},
+		},
+		"streamSettings": map[string]any{
+			"security": "none",
+			"network":  "mkcp",
+			"kcpSettings": map[string]any{
+				"mtu": float64(132), "tti": float64(20), "uplinkCapacity": float64(5), "downlinkCapacity": float64(20), "congestion": false,
+			},
+			"finalmask": map[string]any{
+				"udp": []any{
+					map[string]any{
+						"type": "xdns",
+						"settings": map[string]any{
+							"resolvers": []any{"a.onionchips.sbs+udp://8.8.8.8:53", "a.onionchips.sbs+udp://1.1.1.1:53"},
+						},
+					},
+				},
+			},
+		},
+	}
+	opts := option.XrayOutboundOptions{XConfig: &xconfig}
+
+	adapterOutbound, err := New(context.Background(), nil, log.NewNOPFactory().Logger(), "test-out", opts)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	adapterOutbound.(*Outbound).Close()
+}
+
+// TestClampKcpMtuAboveCeiling checks the symmetric case (an oversized mtu gets pulled down to
+// 1460) so the clamp isn't accidentally one-directional.
+func TestClampKcpMtuAboveCeiling(t *testing.T) {
+	in := map[string]any{
+		"kcpSettings": map[string]any{"mtu": float64(9000)},
+	}
+	got := clampKcpMtu(context.Background(), log.NewNOPFactory().Logger(), in)
+	want := map[string]any{
+		"kcpSettings": map[string]any{"mtu": float64(1460)},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("clampKcpMtu mismatch:\ngot:  %#v\nwant: %#v", got, want)
+	}
+}
+
+// TestClampKcpMtuInRangeUnchanged checks a value already inside [576, 1460] passes through as-is.
+func TestClampKcpMtuInRangeUnchanged(t *testing.T) {
+	in := map[string]any{
+		"kcpSettings": map[string]any{"mtu": float64(1200)},
+	}
+	got := clampKcpMtu(context.Background(), log.NewNOPFactory().Logger(), in)
+	want := map[string]any{
+		"kcpSettings": map[string]any{"mtu": float64(1200)},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("clampKcpMtu mismatch:\ngot:  %#v\nwant: %#v", got, want)
+	}
+}
