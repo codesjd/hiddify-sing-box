@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -56,6 +57,17 @@ import (
 // is what routing/UI actually see.
 const xrayInternalOutboundTag = "out"
 
+// abandonedConnBackstop is a last-resort ceiling on a single dispatch's lifetime, guarding only
+// against a caller that dials and then never reads, writes, or closes the returned conn (a bug
+// elsewhere leaking the dispatch goroutine forever). It is deliberately generous - long-lived
+// proxied sessions (downloads, streams) are normal and must not be cut short by it - the primary,
+// immediate cancellation path is the conn's Close() (wired below via cnc.ConnectionOnClose).
+const abandonedConnBackstop = 30 * time.Minute
+
+// drainTimeout bounds how long Close() waits for in-flight dispatches to unwind after
+// cancellation, so a stuck dispatch can't hang shutdown indefinitely.
+const drainTimeout = 5 * time.Second
+
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.XrayOutboundOptions](registry, C.TypeXray, New)
 }
@@ -67,6 +79,10 @@ type Outbound struct {
 	logger   logger.ContextLogger
 	instance *xcore.Instance
 	handler  xoutbound.Handler
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 
 	closeOnce sync.Once
 }
@@ -142,35 +158,53 @@ func New(ctx context.Context, router adapter.Router, logger log.ContextLogger, t
 		logger.WarnContext(ctx, "xray: xray_fragment is set but not applied by the embedded outbound; ignoring")
 	}
 
+	outboundCtx, cancel := context.WithCancel(ctx)
 	return &Outbound{
 		Adapter:  outbound.NewAdapter(C.TypeXray, tag, []string{"tcp", "udp"}, nil),
 		logger:   logger,
 		instance: instance,
 		handler:  handler,
+		ctx:      outboundCtx,
+		cancel:   cancel,
 	}, nil
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	dest := socksaddrToXrayDestination(destination, network == "udp")
-	link, conn := newBridgedConn(dest)
+	conn, err := h.dispatch(dest)
+	if err != nil {
+		return nil, err
+	}
 	h.logger.InfoContext(ctx, "xray outbound connection to ", destination)
-	go h.handler.Dispatch(withXrayOutboundTarget(ctx, dest), link)
 	return conn, nil
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	dest := socksaddrToXrayDestination(destination, true)
-	link, conn := newBridgedConn(dest)
+	conn, err := h.dispatch(dest)
+	if err != nil {
+		return nil, err
+	}
 	h.logger.InfoContext(ctx, "xray outbound packet connection to ", destination)
-	go h.handler.Dispatch(withXrayOutboundTarget(ctx, dest), link)
 	return &packetConn{Conn: conn, remote: destination}, nil
 }
 
 func (h *Outbound) Close() error {
 	var err error
 	h.closeOnce.Do(func() {
+		h.cancel()
 		if h.instance != nil {
 			err = h.instance.Close()
+		}
+		drained := make(chan struct{})
+		go func() {
+			h.wg.Wait()
+			close(drained)
+		}()
+		select {
+		case <-drained:
+		case <-time.After(drainTimeout):
+			h.logger.Warn("xray: timed out waiting for in-flight dispatches to drain on close")
 		}
 	})
 	return err
@@ -206,12 +240,23 @@ func socksaddrToXrayDestination(destination M.Socksaddr, udp bool) xnet.Destinat
 	return xnet.TCPDestination(addr, port)
 }
 
-// newBridgedConn wires up a pair of xray-core pipes into a transport.Link (handed to the outbound
+// dispatch wires up a pair of xray-core pipes into a transport.Link (handed to the outbound
 // handler) and a net.Conn (handed back to sing-box), so writes on the net.Conn become reads on the
 // handler's link.Reader, and the handler's link.Writer becomes reads on the net.Conn - the same
 // buf.Reader/buf.Writer <-> net.Conn bridge xray-core's own proxy/loopback outbound uses to hand a
-// dispatched connection back out as a plain net.Conn.
-func newBridgedConn(dest xnet.Destination) (*xtransport.Link, net.Conn) {
+// dispatched connection back out as a plain net.Conn - then runs h.handler.Dispatch on it in a
+// goroutine bounded by both h.ctx (cancelled on Close) and abandonedConnBackstop (a last-resort
+// ceiling in case the caller dials and then never reads, writes, or closes the returned conn).
+// Closing the returned conn cancels the dispatch's context immediately, the common path; the
+// backstop only matters for a caller that never closes it at all. Either way h.wg accounts for
+// the dispatch goroutine itself, not the conn's lifetime, so Close() can wait for it accurately.
+func (h *Outbound) dispatch(dest xnet.Destination) (net.Conn, error) {
+	if h.ctx.Err() != nil {
+		return nil, E.New("xray: outbound is closing")
+	}
+
+	dispatchCtx, cancel := context.WithTimeout(h.ctx, abandonedConnBackstop)
+
 	uplinkReader, uplinkWriter := xpipe.New()
 	downlinkReader, downlinkWriter := xpipe.New()
 
@@ -223,13 +268,35 @@ func newBridgedConn(dest xnet.Destination) (*xtransport.Link, net.Conn) {
 	} else {
 		outputOpt = xcnc.ConnectionOutputMulti(downlinkReader)
 	}
-	conn := xcnc.NewConnection(xcnc.ConnectionInputMulti(uplinkWriter), outputOpt)
-	return link, conn
+	conn := xcnc.NewConnection(
+		xcnc.ConnectionInputMulti(uplinkWriter),
+		outputOpt,
+		xcnc.ConnectionOnClose(closerFunc(func() error {
+			cancel()
+			return nil
+		})),
+	)
+
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		defer cancel()
+		h.handler.Dispatch(withXrayOutboundTarget(dispatchCtx, dest), link)
+	}()
+
+	return conn, nil
 }
 
-// packetConn adapts the connected, single-destination net.Conn newBridgedConn returns into a
+// closerFunc adapts a func() error to io.Closer, for cnc.ConnectionOnClose.
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
+
+// packetConn adapts the connected, single-destination net.Conn newDispatch returns into a
 // net.PacketConn - outbound UDP-through-a-proxy-tag is inherently tied to one destination for the
-// life of the dispatch, so ReadFrom/WriteTo just report/ignore that fixed peer address.
+// life of the dispatch (ListenPacket is called once per sing-box UDP session/NAT entry, matching
+// the destination it was dialed for), so ReadFrom always reports that fixed peer address, and
+// WriteTo rejects any other target rather than silently misrouting it there.
 type packetConn struct {
 	net.Conn
 	remote M.Socksaddr
@@ -240,6 +307,9 @@ func (c *packetConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	return n, c.remote.UDPAddr(), err
 }
 
-func (c *packetConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
+func (c *packetConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if addr != nil && M.SocksaddrFromNet(addr) != c.remote {
+		return 0, E.New("xray: packet conn is bound to ", c.remote, ", cannot write to ", addr)
+	}
 	return c.Conn.Write(p)
 }
