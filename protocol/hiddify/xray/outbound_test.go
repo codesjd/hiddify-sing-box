@@ -289,7 +289,7 @@ func TestClampKcpMtuAboveCeiling(t *testing.T) {
 	}
 	got := clampKcpMtu(context.Background(), log.NewNOPFactory().Logger(), in)
 	want := map[string]any{
-		"kcpSettings": map[string]any{"mtu": float64(1460)},
+		"kcpSettings": map[string]any{"mtu": int64(1460)},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("clampKcpMtu mismatch:\ngot:  %#v\nwant: %#v", got, want)
@@ -303,7 +303,26 @@ func TestClampKcpMtuInRangeUnchanged(t *testing.T) {
 	}
 	got := clampKcpMtu(context.Background(), log.NewNOPFactory().Logger(), in)
 	want := map[string]any{
-		"kcpSettings": map[string]any{"mtu": float64(1200)},
+		"kcpSettings": map[string]any{"mtu": int64(1200)},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("clampKcpMtu mismatch:\ngot:  %#v\nwant: %#v", got, want)
+	}
+}
+
+// TestClampKcpMtuHandlesPlainIntType guards against a real bug this exact test caught: a bare
+// `item.(float64)` type assertion only matches values that arrived via json.Unmarshal (the "Full
+// Xray json" subscription-array path). ray2sing's link converters (getkcp) build the map directly
+// in Go and hand this a plain `int`, which silently failed the type assertion and skipped clamping
+// entirely - meaning a link's own mtu=132 param would reach xray-core's build step unclamped and
+// fail exactly the way the object-form-range and JSON-array cases already had.
+func TestClampKcpMtuHandlesPlainIntType(t *testing.T) {
+	in := map[string]any{
+		"kcpSettings": map[string]any{"mtu": 132},
+	}
+	got := clampKcpMtu(context.Background(), log.NewNOPFactory().Logger(), in)
+	want := map[string]any{
+		"kcpSettings": map[string]any{"mtu": int64(576)},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("clampKcpMtu mismatch:\ngot:  %#v\nwant: %#v", got, want)

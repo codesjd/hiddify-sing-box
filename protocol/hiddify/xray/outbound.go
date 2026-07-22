@@ -115,7 +115,7 @@ func clampKcpMtu(ctx context.Context, logger logger.ContextLogger, v any) any {
 		out := make(map[string]any, len(val))
 		for k, item := range val {
 			if k == "mtu" {
-				if num, ok := item.(float64); ok {
+				if num, ok := asFloat64(item); ok {
 					clamped := num
 					if clamped < 576 {
 						clamped = 576
@@ -125,7 +125,7 @@ func clampKcpMtu(ctx context.Context, logger logger.ContextLogger, v any) any {
 					if clamped != num {
 						logger.WarnContext(ctx, fmt.Sprintf("xray: kcp mtu %d is outside xray-core's accepted 576-1460 range; clamping to %d", int64(num), int64(clamped)))
 					}
-					out[k] = clamped
+					out[k] = int64(clamped)
 					continue
 				}
 			}
@@ -140,6 +140,42 @@ func clampKcpMtu(ctx context.Context, logger logger.ContextLogger, v any) any {
 		return out
 	default:
 		return v
+	}
+}
+
+// asFloat64 extracts a numeric value regardless of its concrete Go type. "mtu" reaches this code
+// two different ways with two different concrete types: json.Unmarshal into map[string]any (the
+// "Full Xray json" subscription-array path, and normalizeRangeObjects' own output) always produces
+// float64, while ray2sing's link converters (getkcp) build the map directly in Go and hand it a
+// plain int - a bare float64 type assertion only catches the first case.
+func asFloat64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int8:
+		return float64(n), true
+	case int16:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case uint:
+		return float64(n), true
+	case uint8:
+		return float64(n), true
+	case uint16:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	default:
+		return 0, false
 	}
 }
 
