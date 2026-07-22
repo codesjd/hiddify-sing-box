@@ -233,6 +233,8 @@ func New(ctx context.Context, router adapter.Router, logger log.ContextLogger, t
 		return nil, E.New("xray: no outbound config provided (xconfig or xray_outbound_raw)")
 	}
 
+	installOutboundInterfaceExclusion(ctx, logger)
+
 	normalized := normalizeRangeObjects(map[string]any(*rawConfig))
 	normalized = clampKcpMtu(ctx, logger, normalized)
 	rawOutbound, err := json.Marshal(normalized)
