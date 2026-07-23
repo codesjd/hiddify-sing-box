@@ -328,3 +328,64 @@ func TestClampKcpMtuHandlesPlainIntType(t *testing.T) {
 		t.Fatalf("clampKcpMtu mismatch:\ngot:  %#v\nwant: %#v", got, want)
 	}
 }
+
+// TestXdnsAndXicmpMasksBuildRealInstance guards xdns/xicmp support in the bundled Xray-core
+// engine. The vendored fork this project used to pin (github.com/hiddify/xray-core, a single
+// frozen commit with no tags or updates since) never implemented these mask types at all - only
+// "salamander" was ever registered in its udpmaskLoader, confirmed against both that pinned commit
+// and the live github.com/hiddify/xray-core main branch. Real upstream github.com/xtls/xray-core
+// added xdns and xicmp (transport/internet/finalmask/xdns and .../xicmp) well before this - this
+// project now depends on that real upstream directly (see go.mod) at a commit matching the schema
+// hiddify-manager's own server templates generate against (a top-level "udpmasks" array of
+// {"type","settings"} objects - an earlier schema revision used "finalmask"/{"udp":[...]} instead,
+// which is why getFinalmask's shape matters - see ray2sing's xray_common.go).
+func TestXdnsAndXicmpMasksBuildRealInstance(t *testing.T) {
+	cases := []struct {
+		name string
+		mask map[string]any
+	}{
+		{
+			name: "xdns",
+			mask: map[string]any{
+				"type":     "xdns",
+				"settings": map[string]any{"domains": []any{"a.onionchips.sbs"}},
+			},
+		},
+		{
+			name: "xicmp",
+			mask: map[string]any{
+				"type":     "xicmp",
+				"settings": map[string]any{"dgram": true, "ips": []any{}},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			xconfig := map[string]any{
+				"protocol": "vless",
+				"settings": map[string]any{
+					"vnext": []any{
+						map[string]any{
+							"address": "8.8.8.8",
+							"port":    float64(53),
+							"users": []any{
+								map[string]any{"id": "6aca7d1d-632c-464f-b8de-f640962d89c7", "encryption": "none"},
+							},
+						},
+					},
+				},
+				"streamSettings": map[string]any{
+					"network":     "mkcp",
+					"kcpSettings": map[string]any{"mtu": float64(576)},
+					"udpmasks":    []any{c.mask},
+				},
+			}
+			opts := option.XrayOutboundOptions{XConfig: &xconfig}
+			adapterOutbound, err := New(context.Background(), nil, log.NewNOPFactory().Logger(), "test-out", opts)
+			if err != nil {
+				t.Fatalf("real xray-core instance failed to build/start with a %q mask: %v", c.name, err)
+			}
+			adapterOutbound.(*Outbound).Close()
+		})
+	}
+}
