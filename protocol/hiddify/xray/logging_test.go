@@ -92,3 +92,103 @@ func TestXrayLogForwarderSurfacesRealDialFailure(t *testing.T) {
 	}
 	t.Fatalf("expected the real xray-core dial failure (connection refused) to be forwarded into our logger, got: %v", rec.snapshot())
 }
+
+// closedPort returns a TCP port guaranteed to refuse connections immediately and
+// deterministically, without any real network access.
+func closedPort(t *testing.T) *net.TCPAddr {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().(*net.TCPAddr)
+	ln.Close()
+	return addr
+}
+
+func newFreedomOutboundForTest(t *testing.T, tag string, rec *recordingLogger) *Outbound {
+	t.Helper()
+	xconfig := map[string]any{"protocol": "freedom", "tag": "test"}
+	opts := option.XrayOutboundOptions{XConfig: &xconfig}
+	adapterOutbound, err := New(context.Background(), nil, rec, tag, opts)
+	if err != nil {
+		t.Fatalf("New(%q): %v", tag, err)
+	}
+	return adapterOutbound.(*Outbound)
+}
+
+func dialClosedPort(ob *Outbound, addr *net.TCPAddr) {
+	conn, err := ob.DialContext(context.Background(), "tcp", M.ParseSocksaddrHostPort(addr.IP.String(), uint16(addr.Port)))
+	if err == nil {
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		buf := make([]byte, 16)
+		conn.Read(buf)
+		conn.Close()
+	}
+}
+
+func waitForLineContaining(t *testing.T, rec *recordingLogger, substrs ...string) string {
+	t.Helper()
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, line := range rec.snapshot() {
+			all := true
+			for _, s := range substrs {
+				if !strings.Contains(line, s) {
+					all = false
+					break
+				}
+			}
+			if all {
+				return line
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for a line containing %v, got: %v", substrs, rec.snapshot())
+	return ""
+}
+
+// TestXrayLogForwarderDoesNotMisattributeWithMultipleActiveInstances is the regression guard for
+// the tag-misattribution bug found from a real user log: xray-core's log.Handler carries no
+// per-instance context at all (see logging.go's doc comment), so with more than one embedded
+// "xray" outbound alive at once, the old single-pointer scheme permanently mislabeled every
+// instance's traffic with whichever outbound happened to be constructed last - observed as dozens
+// of clearly-unrelated transports/servers all appearing under one single tag for an entire
+// session. With two instances alive simultaneously, forwarded messages must not claim either
+// specific tag; once back down to one, attribution must be trustworthy again.
+func TestXrayLogForwarderDoesNotMisattributeWithMultipleActiveInstances(t *testing.T) {
+	rec := &recordingLogger{ContextLogger: log.NewNOPFactory().Logger()}
+
+	obA := newFreedomOutboundForTest(t, "outbound-a", rec)
+	obB := newFreedomOutboundForTest(t, "outbound-b", rec)
+	defer obA.Close()
+	defer obB.Close()
+
+	addr := closedPort(t)
+	dialClosedPort(obA, addr)
+	dialClosedPort(obB, addr)
+
+	line := waitForLineContaining(t, rec, "connection refused")
+	if strings.Contains(line, "outbound-a") || strings.Contains(line, "outbound-b") {
+		t.Fatalf("expected an ambiguous-attribution line while 2 instances are alive, got a specific tag instead: %q", line)
+	}
+	if !strings.Contains(line, "ambiguous") {
+		t.Fatalf("expected the ambiguous-attribution marker, got: %q", line)
+	}
+
+	// Back down to a single active instance - attribution should become trustworthy again.
+	obB.Close()
+	rec.mu.Lock()
+	rec.lines = nil
+	rec.mu.Unlock()
+
+	dialClosedPort(obA, addr)
+	line = waitForLineContaining(t, rec, "connection refused")
+	if !strings.Contains(line, "outbound-a") {
+		t.Fatalf("expected the single remaining instance's real tag once only one is alive, got: %q", line)
+	}
+	if strings.Contains(line, "ambiguous") {
+		t.Fatalf("did not expect the ambiguous marker with only 1 instance alive, got: %q", line)
+	}
+}

@@ -2,26 +2,15 @@ package xray
 
 import (
 	"context"
-	"sync/atomic"
+	"fmt"
+	"sync"
 
 	"github.com/sagernet/sing/common/logger"
 	xlog "github.com/xtls/xray-core/common/log"
 )
 
-// xrayLogSink is the (tag, logger) pair the process-wide xray-core log forwarder currently
-// attributes messages to.
-type xrayLogSink struct {
-	tag    string
-	logger logger.ContextLogger
-}
-
-var activeXraySink atomic.Pointer[xrayLogSink]
-
-// installXrayLogForwarder (re-)registers a process-wide xray-core log handler that forwards
-// Warning/Error-severity messages into sing-box's own logger, and points it at this outbound as
-// the current attribution target.
-//
-// This exists because xray-core's log system is a single global handler (see
+// xraySinks tracks every currently-alive embedded xray-core instance's (tag, logger) pair. This
+// exists because xray-core's log system is a single global handler (see
 // common/log.RegisterHandler: "Previous registered handler will be discarded"), and every embedded
 // xray-core instance this package creates re-registers its own app/log.Instance as part of
 // xcore.New() (app/log.New() unconditionally calls log.RegisterHandler on construction - see that
@@ -44,13 +33,39 @@ var activeXraySink atomic.Pointer[xrayLogSink]
 // per-packet chatter that caused the earlier trace-level, 11GB-in-seconds disk problem - see
 // xrayLogLevel/XDebug for that much chattier, still-opt-in path.
 //
-// Because xray-core's Handler interface carries no per-instance context, concurrently active
-// "xray" outbounds (e.g. during a URL-test sweep over many proxy entries) all funnel through
-// whichever one registered most recently; messages are prefixed with that outbound's tag so the
-// attribution mismatch, on the rare occasion it happens, is at least visible rather than silent.
-func installXrayLogForwarder(tag string, sink logger.ContextLogger) {
-	activeXraySink.Store(&xrayLogSink{tag: tag, logger: sink})
+// Because xray-core's Handler interface carries no per-instance context whatsoever (GeneralMessage
+// is just {Severity, Content}, see common/log.go - nothing identifies which xcore.Instance produced
+// it), a naive "whichever outbound registered most recently owns the tag" scheme is wrong far more
+// often than not for any real subscription: every embedded xray-core instance constructed at
+// startup re-claims the global handler in turn, so the LAST one built ends up permanently
+// misattributed as the source of every other instance's traffic for the rest of the session -
+// observed directly in a user-submitted log where dozens of clearly-different transports (kcp,
+// grpc, xhttp, websocket, vless, vmess dials to many different servers) all appeared under one
+// single outbound's tag. xraySinks tracks every instance still alive (registered in New(), removed
+// in Close()) so Handle can tell the difference between "exactly one instance is active - the tag
+// is trustworthy" and "N are active - the tag would be a guess," and only claims attribution in the
+// former case.
+var (
+	xraySinksMu sync.Mutex
+	xraySinks   = map[string]logger.ContextLogger{}
+)
+
+// installXrayLogForwarder (re-)registers the process-wide xray-core log handler (idempotent in
+// effect - see the doc comment above for why every instance must still call this on every
+// construction) and adds this outbound to the active-instance registry. The returned func removes
+// it again and must be called from the outbound's Close().
+func installXrayLogForwarder(tag string, sink logger.ContextLogger) (unregister func()) {
+	xraySinksMu.Lock()
+	xraySinks[tag] = sink
+	xraySinksMu.Unlock()
+
 	xlog.RegisterHandler(xrayLogForwarderHandler{})
+
+	return func() {
+		xraySinksMu.Lock()
+		delete(xraySinks, tag)
+		xraySinksMu.Unlock()
+	}
 }
 
 type xrayLogForwarderHandler struct{}
@@ -60,9 +75,37 @@ func (xrayLogForwarderHandler) Handle(msg xlog.Message) {
 	if !ok || general.Severity > xlog.Severity_Info {
 		return
 	}
-	sink := activeXraySink.Load()
+
+	xraySinksMu.Lock()
+	var tag string
+	var sink logger.ContextLogger
+	count := len(xraySinks)
+	if count == 1 {
+		for t, l := range xraySinks {
+			tag, sink = t, l
+		}
+	} else if count > 1 {
+		// Any one of them writes to the same underlying box log either way - picking one is just
+		// about finding a writer, not about attribution, which is exactly what can't be trusted
+		// here. Iteration order is unspecified but that's fine: which of the N active loggers
+		// happens to carry this one line makes no difference to what gets written.
+		for _, l := range xraySinks {
+			sink = l
+			break
+		}
+	}
+	xraySinksMu.Unlock()
+
 	if sink == nil {
 		return
 	}
-	sink.logger.InfoContext(context.Background(), "xray-core[", sink.tag, "]: ", msg.String())
+	if count == 1 {
+		sink.InfoContext(context.Background(), "xray-core[", tag, "]: ", msg.String())
+		return
+	}
+	// count > 1: deliberately not claiming a specific outbound's tag here - it would be a guess,
+	// and the earlier single-tag scheme's guesses were wrong often enough to actively mislead
+	// debugging. The message's own content (destination host/port, protocol) is usually still
+	// enough to tell which server it's about.
+	sink.InfoContext(context.Background(), "xray-core[ambiguous, ", fmt.Sprint(count), " active xray instances]: ", msg.String())
 }

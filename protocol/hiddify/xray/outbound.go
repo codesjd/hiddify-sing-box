@@ -212,7 +212,8 @@ type Outbound struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	closeOnce sync.Once
+	unregisterLog func()
+	closeOnce     sync.Once
 }
 
 // New builds a single-outbound, no-inbound xray-core instance from the raw xray-core outbound
@@ -270,15 +271,17 @@ func New(ctx context.Context, router adapter.Router, logger log.ContextLogger, t
 	if err := instance.Start(); err != nil {
 		return nil, E.Cause(err, "xray: start instance")
 	}
-	installXrayLogForwarder(tag, logger)
+	unregisterLog := installXrayLogForwarder(tag, logger)
 
 	manager, ok := instance.GetFeature(xoutbound.ManagerType()).(xoutbound.Manager)
 	if !ok {
+		unregisterLog()
 		instance.Close()
 		return nil, E.New("xray: outbound manager unavailable")
 	}
 	handler := manager.GetHandler(xrayInternalOutboundTag)
 	if handler == nil {
+		unregisterLog()
 		instance.Close()
 		return nil, E.New("xray: outbound handler not registered")
 	}
@@ -293,12 +296,13 @@ func New(ctx context.Context, router adapter.Router, logger log.ContextLogger, t
 
 	outboundCtx, cancel := context.WithCancel(ctx)
 	return &Outbound{
-		Adapter:  outbound.NewAdapter(C.TypeXray, tag, []string{"tcp", "udp"}, nil),
-		logger:   logger,
-		instance: instance,
-		handler:  handler,
-		ctx:      outboundCtx,
-		cancel:   cancel,
+		Adapter:       outbound.NewAdapter(C.TypeXray, tag, []string{"tcp", "udp"}, nil),
+		logger:        logger,
+		instance:      instance,
+		handler:       handler,
+		ctx:           outboundCtx,
+		cancel:        cancel,
+		unregisterLog: unregisterLog,
 	}, nil
 }
 
@@ -326,6 +330,9 @@ func (h *Outbound) Close() error {
 	var err error
 	h.closeOnce.Do(func() {
 		h.cancel()
+		if h.unregisterLog != nil {
+			h.unregisterLog()
+		}
 		if h.instance != nil {
 			err = h.instance.Close()
 		}
