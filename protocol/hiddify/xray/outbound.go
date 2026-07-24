@@ -97,88 +97,6 @@ func normalizeRangeObjects(v any) any {
 	}
 }
 
-// clampKcpMtu rewrites any "mtu" key found anywhere in the raw JSON tree whose value falls outside
-// xray-core's own hard-enforced KCP MTU range into the nearest boundary value, logging what it did.
-// infra/conf.KCPConfig.Build() rejects anything outside 576-1460 with a build error rather than a
-// warning (verified against both the exact xray-core version this project vendors and the current
-// github.com/hiddify/xray-core source), and "mtu" appears exactly once in xray-core's entire
-// outbound JSON schema - on KCPConfig - so this is unambiguous wherever it fires. hiddify-manager's
-// own generated subscriptions intentionally use small MTUs (observed: 132) for xdns/xicmp entries,
-// whose payloads are tiny DNS-sized UDP packets - a reasonable choice at the KCP-protocol level,
-// just one this embedded engine's config-time validation refuses outright instead of merely
-// flagging. Clamping to the nearest value the engine will actually accept lets the outbound build
-// and run - KCP just uses slightly larger frames than strictly necessary - instead of failing to
-// start at all.
-func clampKcpMtu(ctx context.Context, logger logger.ContextLogger, v any) any {
-	switch val := v.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(val))
-		for k, item := range val {
-			if k == "mtu" {
-				if num, ok := asFloat64(item); ok {
-					clamped := num
-					if clamped < 576 {
-						clamped = 576
-					} else if clamped > 1460 {
-						clamped = 1460
-					}
-					if clamped != num {
-						logger.WarnContext(ctx, fmt.Sprintf("xray: kcp mtu %d is outside xray-core's accepted 576-1460 range; clamping to %d", int64(num), int64(clamped)))
-					}
-					out[k] = int64(clamped)
-					continue
-				}
-			}
-			out[k] = clampKcpMtu(ctx, logger, item)
-		}
-		return out
-	case []any:
-		out := make([]any, len(val))
-		for i, item := range val {
-			out[i] = clampKcpMtu(ctx, logger, item)
-		}
-		return out
-	default:
-		return v
-	}
-}
-
-// asFloat64 extracts a numeric value regardless of its concrete Go type. "mtu" reaches this code
-// two different ways with two different concrete types: json.Unmarshal into map[string]any (the
-// "Full Xray json" subscription-array path, and normalizeRangeObjects' own output) always produces
-// float64, while ray2sing's link converters (getkcp) build the map directly in Go and hand it a
-// plain int - a bare float64 type assertion only catches the first case.
-func asFloat64(v any) (float64, bool) {
-	switch n := v.(type) {
-	case float64:
-		return n, true
-	case float32:
-		return float64(n), true
-	case int:
-		return float64(n), true
-	case int8:
-		return float64(n), true
-	case int16:
-		return float64(n), true
-	case int32:
-		return float64(n), true
-	case int64:
-		return float64(n), true
-	case uint:
-		return float64(n), true
-	case uint8:
-		return float64(n), true
-	case uint16:
-		return float64(n), true
-	case uint32:
-		return float64(n), true
-	case uint64:
-		return float64(n), true
-	default:
-		return 0, false
-	}
-}
-
 // xrayInternalOutboundTag is the fixed tag used inside the embedded, single-outbound xray-core
 // instance. The manager/ray2sing-supplied tag (options.XConfig["tag"]) is discarded and replaced
 // with this, since it's irrelevant beyond this package - sing-box's own tag (the outer Outbound.Tag)
@@ -237,7 +155,6 @@ func New(ctx context.Context, router adapter.Router, logger log.ContextLogger, t
 	installOutboundInterfaceExclusion(ctx, logger)
 
 	normalized := normalizeRangeObjects(map[string]any(*rawConfig))
-	normalized = clampKcpMtu(ctx, logger, normalized)
 	rawOutbound, err := json.Marshal(normalized)
 	if err != nil {
 		return nil, E.Cause(err, "xray: marshal outbound config")

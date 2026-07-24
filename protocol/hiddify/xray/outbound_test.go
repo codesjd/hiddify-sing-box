@@ -2,6 +2,7 @@ package xray
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"reflect"
@@ -12,6 +13,8 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	M "github.com/sagernet/sing/common/metadata"
+	xconf "github.com/xtls/xray-core/infra/conf"
+	"github.com/xtls/xray-core/transport/internet/kcp"
 )
 
 // TestDialEchoAndClose exercises the real dispatch path end to end (a "freedom" outbound
@@ -231,15 +234,27 @@ func TestObjectFormRangeConfigBuildsRealInstance(t *testing.T) {
 	defer ob.Close()
 }
 
-// TestKcpMtuBelowFloorClampsAndBuilds reproduces the exact "a.onionchips.sbs XDNS" outbound from a
-// real hiddify-manager subscription (pulled from a user's live config export), which sets
-// kcpSettings.mtu to 132 - a deliberately small value since this outbound only ever carries tiny
-// DNS-sized UDP payloads (via the xdns finalmask). xray-core's own infra/conf.KCPConfig.Build()
-// hard-rejects anything under 576 with "invalid mKCP MTU size: 132" - confirmed against both the
-// exact vendored xray-core version and the current github.com/hiddify/xray-core source, so this
-// isn't fixable by changing what JSON we generate, only by adapting what we send before it reaches
-// that check. Without clampKcpMtu, this outbound fails to build at all.
-func TestKcpMtuBelowFloorClampsAndBuilds(t *testing.T) {
+// TestKcpMtu132BuildsUnmodified reproduces the exact "a.onionchips.sbs XDNS" outbound from a real
+// hiddify-manager subscription (pulled from a user's live config export), which sets
+// kcpSettings.mtu to 132 - a deliberately small value chosen specifically to stay under the 224-
+// byte hard ceiling xdns's own client.go encode() enforces on each raw mKCP segment
+// (ray2sing/ray2sing/xrayjson.py's own comment: any mtu>=224 here "tunnels zero real traffic",
+// since every oversized segment gets silently dropped rather than erroring).
+//
+// A prior version of this package had a clampKcpMtu step that force-raised any mtu below 576 up
+// to 576, based on the belief that xray-core's own infra/conf.KCPConfig.Build() hard-rejects
+// anything under 576. That belief was true of the OLD vendored github.com/hiddify/xray-core fork,
+// but this project has since switched to real upstream github.com/xtls/xray-core (for xdns/xicmp
+// support) - whose actual Build() floor is just 21 (confirmed directly against
+// infra/conf/transport_internet.go: "if config.Mtu < 21 { ... }", no upper bound at all). Nobody
+// revisited clampKcpMtu after that switch, so it kept silently overwriting the manager's
+// deliberately-small mtu=132 with 576 - safely under xray-core's own build-time floor, but now
+// well over xdns's separate 224-byte transmit-time ceiling, so every KCP segment carrying a real
+// payload got silently dropped by the mask layer: the outbound built and "worked" by every check
+// that only asked "did New() return an error", while genuinely carrying zero real traffic. This
+// test asserts the *unmodified* mtu=132 reaches the built xray-core KCP transport settings, not
+// just that New() succeeds.
+func TestKcpMtu132BuildsUnmodified(t *testing.T) {
 	xconfig := map[string]any{
 		"protocol": "vless",
 		"tag":      "proxy",
@@ -279,53 +294,38 @@ func TestKcpMtuBelowFloorClampsAndBuilds(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	adapterOutbound.(*Outbound).Close()
-}
 
-// TestClampKcpMtuAboveCeiling checks the symmetric case (an oversized mtu gets pulled down to
-// 1460) so the clamp isn't accidentally one-directional.
-func TestClampKcpMtuAboveCeiling(t *testing.T) {
-	in := map[string]any{
-		"kcpSettings": map[string]any{"mtu": float64(9000)},
+	// The above only proves the outbound builds and starts - exactly what the old, wrongly-
+	// clamped mtu=576 also did, while silently dropping all real traffic. Rebuild the same
+	// streamSettings through the same normalizeRangeObjects + xconf.StreamConfig.Build() steps
+	// New() uses internally and decode the actual KCP proto Xray-core ends up with, to prove the
+	// mtu that reaches it is still 132 - not silently rewritten to something xdns can't carry.
+	normalized := normalizeRangeObjects(xconfig["streamSettings"])
+	raw, err := json.Marshal(normalized)
+	if err != nil {
+		t.Fatalf("marshal streamSettings: %v", err)
 	}
-	got := clampKcpMtu(context.Background(), log.NewNOPFactory().Logger(), in)
-	want := map[string]any{
-		"kcpSettings": map[string]any{"mtu": int64(1460)},
+	var sc xconf.StreamConfig
+	if err := json.Unmarshal(raw, &sc); err != nil {
+		t.Fatalf("unmarshal into xconf.StreamConfig: %v", err)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("clampKcpMtu mismatch:\ngot:  %#v\nwant: %#v", got, want)
+	built, err := sc.Build()
+	if err != nil {
+		t.Fatalf("StreamConfig.Build(): %v", err)
 	}
-}
-
-// TestClampKcpMtuInRangeUnchanged checks a value already inside [576, 1460] passes through as-is.
-func TestClampKcpMtuInRangeUnchanged(t *testing.T) {
-	in := map[string]any{
-		"kcpSettings": map[string]any{"mtu": float64(1200)},
+	if len(built.TransportSettings) != 1 {
+		t.Fatalf("expected exactly 1 transport setting (mkcp), got %d", len(built.TransportSettings))
 	}
-	got := clampKcpMtu(context.Background(), log.NewNOPFactory().Logger(), in)
-	want := map[string]any{
-		"kcpSettings": map[string]any{"mtu": int64(1200)},
+	kcpMessage, err := built.TransportSettings[0].Settings.GetInstance()
+	if err != nil {
+		t.Fatalf("decode kcp settings: %v", err)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("clampKcpMtu mismatch:\ngot:  %#v\nwant: %#v", got, want)
+	kcpConfig, ok := kcpMessage.(*kcp.Config)
+	if !ok {
+		t.Fatalf("expected *kcp.Config, got %T", kcpMessage)
 	}
-}
-
-// TestClampKcpMtuHandlesPlainIntType guards against a real bug this exact test caught: a bare
-// `item.(float64)` type assertion only matches values that arrived via json.Unmarshal (the "Full
-// Xray json" subscription-array path). ray2sing's link converters (getkcp) build the map directly
-// in Go and hand this a plain `int`, which silently failed the type assertion and skipped clamping
-// entirely - meaning a link's own mtu=132 param would reach xray-core's build step unclamped and
-// fail exactly the way the object-form-range and JSON-array cases already had.
-func TestClampKcpMtuHandlesPlainIntType(t *testing.T) {
-	in := map[string]any{
-		"kcpSettings": map[string]any{"mtu": 132},
-	}
-	got := clampKcpMtu(context.Background(), log.NewNOPFactory().Logger(), in)
-	want := map[string]any{
-		"kcpSettings": map[string]any{"mtu": int64(576)},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("clampKcpMtu mismatch:\ngot:  %#v\nwant: %#v", got, want)
+	if kcpConfig.Mtu != 132 {
+		t.Fatalf("expected mtu to reach Xray-core unmodified as 132, got %d - a value this high defeats xdns's own 224-byte per-segment limit and silently drops all real traffic", kcpConfig.Mtu)
 	}
 }
 
@@ -335,10 +335,16 @@ func TestClampKcpMtuHandlesPlainIntType(t *testing.T) {
 // "salamander" was ever registered in its udpmaskLoader, confirmed against both that pinned commit
 // and the live github.com/hiddify/xray-core main branch. Real upstream github.com/xtls/xray-core
 // added xdns and xicmp (transport/internet/finalmask/xdns and .../xicmp) well before this - this
-// project now depends on that real upstream directly (see go.mod) at a commit matching the schema
-// hiddify-manager's own server templates generate against (a top-level "udpmasks" array of
-// {"type","settings"} objects - an earlier schema revision used "finalmask"/{"udp":[...]} instead,
-// which is why getFinalmask's shape matters - see ray2sing's xray_common.go).
+// project now depends on that real upstream directly (see go.mod).
+//
+// The mask lives under a top-level "finalmask": {"udp": [...]} object - confirmed directly
+// against infra/conf/transport_internet.go's StreamConfig struct ("FinalMask *FinalMask
+// `json:"finalmask"`", where FinalMask.Udp is the array), NOT a top-level "udpmasks" key. An
+// earlier version of this test (and of ray2sing's getFinalmask) used "udpmasks" - json.Unmarshal
+// into xconf.OutboundDetourConfig silently ignores unrecognized keys, so that variant still built
+// and started an instance without error, just as one running plain unmasked KCP - a false pass
+// that looked like proof this worked. See TestFinalmaskKeyReachesXrayCoreStreamConfig below,
+// which asserts the actual Udpmasks count instead of only "did New() return an error".
 func TestXdnsAndXicmpMasksBuildRealInstance(t *testing.T) {
 	cases := []struct {
 		name string
@@ -377,7 +383,7 @@ func TestXdnsAndXicmpMasksBuildRealInstance(t *testing.T) {
 				"streamSettings": map[string]any{
 					"network":     "mkcp",
 					"kcpSettings": map[string]any{"mtu": float64(576)},
-					"udpmasks":    []any{c.mask},
+					"finalmask":   map[string]any{"udp": []any{c.mask}},
 				},
 			}
 			opts := option.XrayOutboundOptions{XConfig: &xconfig}
@@ -388,4 +394,56 @@ func TestXdnsAndXicmpMasksBuildRealInstance(t *testing.T) {
 			adapterOutbound.(*Outbound).Close()
 		})
 	}
+}
+
+// TestFinalmaskKeyReachesXrayCoreStreamConfig directly proves which top-level JSON key Xray-core's
+// own infra/conf.StreamConfig actually recognizes for masks, by running the exact same
+// marshal/unmarshal/Build() steps New() uses and inspecting the resulting Udpmasks count - not
+// just whether an error was returned. "udpmasks" (an earlier, incorrect assumption baked into both
+// this test and ray2sing's getFinalmask at one point) is confirmed here to be silently dropped:
+// StreamConfig has no field tagged that way, so json.Unmarshal ignores it without error, and
+// Build() produces zero masks. "finalmask": {"udp": [...]} is the one Xray-core's own struct tag
+// declares, and is confirmed here to actually populate Udpmasks.
+func TestFinalmaskKeyReachesXrayCoreStreamConfig(t *testing.T) {
+	mask := map[string]any{
+		"type":     "xdns",
+		"settings": map[string]any{"domains": []any{"a.onionchips.sbs"}},
+	}
+	buildUdpmaskCount := func(t *testing.T, streamSettings map[string]any) int {
+		t.Helper()
+		normalized := normalizeRangeObjects(map[string]any{"streamSettings": streamSettings})
+		raw, err := json.Marshal(normalized)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var oc xconf.OutboundDetourConfig
+		if err := json.Unmarshal(raw, &oc); err != nil {
+			t.Fatalf("unmarshal into xconf.OutboundDetourConfig: %v", err)
+		}
+		built, err := oc.StreamSetting.Build()
+		if err != nil {
+			t.Fatalf("StreamSetting.Build(): %v", err)
+		}
+		return len(built.Udpmasks)
+	}
+
+	t.Run("finalmask key is recognized", func(t *testing.T) {
+		got := buildUdpmaskCount(t, map[string]any{
+			"network":   "mkcp",
+			"finalmask": map[string]any{"udp": []any{mask}},
+		})
+		if got != 1 {
+			t.Fatalf(`expected "finalmask":{"udp":[...]} to register 1 udpmask, got %d`, got)
+		}
+	})
+
+	t.Run("udpmasks key is silently ignored", func(t *testing.T) {
+		got := buildUdpmaskCount(t, map[string]any{
+			"network":  "mkcp",
+			"udpmasks": []any{mask},
+		})
+		if got != 0 {
+			t.Fatalf(`expected a top-level "udpmasks" key to be silently ignored (0 udpmasks), got %d - if this now passes, Xray-core's schema has changed and getFinalmask/this test need updating together`, got)
+		}
+	})
 }
