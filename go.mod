@@ -82,10 +82,7 @@ require (
 	github.com/pion/dtls/v3 v3.1.2 // indirect
 	github.com/pion/stun/v3 v3.1.2 // indirect
 	github.com/pion/transport/v4 v4.0.1 // indirect
-	github.com/riobard/go-bloom v0.0.0-20200614022211-cdc8013cb5b3 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
-	github.com/seiflotfy/cuckoofilter v0.0.0-20240715131351-a2f2c23f1771 // indirect
-	github.com/v2fly/ss-bloomring v0.0.0-20210312155135-28617310f63e // indirect
 	github.com/vishvananda/netlink v1.3.1 // indirect
 	github.com/xtls/reality v0.0.0-20260322125925-9234c772ba8f // indirect
 )
@@ -286,6 +283,12 @@ replace github.com/sagernet/tailscale => ./replace/tailscale
 replace github.com/Psiphon-Labs/quic-go => ./replace/psiphon-quic-go
 
 replace github.com/Psiphon-Labs/psiphon-tls => ./replace/psiphon-tls
+
+// Patched to tolerate single-stack hosts: upstream's xicmp finalmask client required both an
+// IPv4 and an IPv6 unprivileged ICMP socket to open successfully, refusing the outbound entirely
+// if either family was unavailable (e.g. no IPv6 configured, common on Windows) even though one
+// working family is enough. See replace/xray-core/transport/internet/finalmask/xicmp/client.go.
+replace github.com/xtls/xray-core => ./replace/xray-core
 
 replace github.com/net2share/vaydns => github.com/hiddify/vaydns v0.0.0-20260401180616-890dc987a6a9
 
