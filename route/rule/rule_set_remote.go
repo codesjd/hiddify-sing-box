@@ -102,6 +102,7 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 			s.logger.Error(E.Cause(err, "initial rule-set: ", s.options.Tag))
 		}
 	}
+	s.startupTicker = time.NewTicker(10 * time.Second)
 	s.updateTicker = time.NewTicker(s.updateInterval)
 	return nil
 }
