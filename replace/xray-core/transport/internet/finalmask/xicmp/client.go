@@ -35,10 +35,37 @@ type packet struct {
 	err  error
 }
 
+// IcmpPacketConn is the exact subset of *icmp.PacketConn's methods xicmpConnClient actually calls
+// (audited across this file: ReadFrom in recv4/recv6, WriteTo, Close, SetDeadline/SetReadDeadline/
+// SetWriteDeadline - LocalAddr is only ever called on the outer raw conn, never on icmp4/icmp6).
+// *icmp.PacketConn satisfies this structurally with no changes. Defining it lets ListenICMP below
+// be overridden by an importer (e.g. hiddify-core, only on Windows, only when not already running
+// elevated) to hand back a non-OS-backed implementation - such as one proxying packets through a
+// separate elevated helper process - without this package needing any awareness of how or why.
+// Exported (despite otherwise being purely internal plumbing) because Go function-type identity
+// requires exact type matches: an external package assigning its own function value to
+// ListenICMP has to name this return type in its own function literal, which is only possible if
+// the type itself is exported - interface satisfaction being structural doesn't help here, since
+// this is about the *declared* function type, not which concrete type ultimately gets returned.
+type IcmpPacketConn interface {
+	ReadFrom(b []byte) (n int, addr net.Addr, err error)
+	WriteTo(b []byte, addr net.Addr) (n int, err error)
+	Close() error
+	SetDeadline(t time.Time) error
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+}
+
+// ListenICMP opens the underlying ICMP socket. Defaults to the real OS socket via
+// golang.org/x/net/icmp; overridable per the IcmpPacketConn doc comment above.
+var ListenICMP = func(network, address string) (IcmpPacketConn, error) {
+	return icmp.ListenPacket(network, address)
+}
+
 type xicmpConnClient struct {
 	conn     net.PacketConn
-	icmp4    *icmp.PacketConn
-	icmp6    *icmp.PacketConn
+	icmp4    IcmpPacketConn
+	icmp6    IcmpPacketConn
 	udp      bool
 	ips      []netip.Addr
 	clientID [8]byte
@@ -50,14 +77,14 @@ type xicmpConnClient struct {
 }
 
 func NewConnClient(c *Config, raw net.PacketConn) (net.PacketConn, error) {
-	var icmp4, icmp6 *icmp.PacketConn
+	var icmp4, icmp6 IcmpPacketConn
 	var err4, err6 error
 	if c.DGRAM {
-		icmp4, err4 = icmp.ListenPacket("udp4", "0.0.0.0")
-		icmp6, err6 = icmp.ListenPacket("udp6", "::")
+		icmp4, err4 = ListenICMP("udp4", "0.0.0.0")
+		icmp6, err6 = ListenICMP("udp6", "::")
 	} else {
-		icmp4, err4 = icmp.ListenPacket("ip4:icmp", "0.0.0.0")
-		icmp6, err6 = icmp.ListenPacket("ip6:ipv6-icmp", "::")
+		icmp4, err4 = ListenICMP("ip4:icmp", "0.0.0.0")
+		icmp6, err6 = ListenICMP("ip6:ipv6-icmp", "::")
 	}
 	// Only fail if NEITHER family is usable. A host with no IPv6 configured (very common,
 	// especially on Windows clients) or one where only the v4 or v6 unprivileged ICMP
