@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/monitoring"
+	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -230,8 +231,12 @@ func (w *Endpoint) NewConnectionEx(ctx context.Context, conn net.Conn, source M.
 }
 
 func (o *Endpoint) Start(stage adapter.StartStage) error {
-	if stage != adapter.StartStateStart {
-		// return o.endpoint.Start(false)
+	// o.Device (the embedded *awg.Device) must actually be started here: it builds the real
+	// amneziawg-go device, applies the IPC config (private/public keys, jc/jmin/jmax/s1-4/h1-4/i1-5),
+	// starts the tun adapter and brings the device up. Without this call the endpoint silently never
+	// connects - IsReady() stays false forever and every packet routed to it times out.
+	if err := o.Device.Start(stage); err != nil {
+		return err
 	}
 	if stage == adapter.StartStatePostStart {
 		go o.readyChecker()
@@ -240,18 +245,23 @@ func (o *Endpoint) Start(stage adapter.StartStage) error {
 }
 
 func (w *Endpoint) readyChecker() {
-	defer func() {
-		w.started = true
-		monitoring.Get(w.ctx).TestNow(w.Tag())
-	}()
-	for i := 0; i < 10; i++ {
-		if w.IsReady() {
-			return
-		}
+	// Mirrors protocol/wireguard's own readyChecker: an actual connectivity probe through the
+	// tunnel, not a blind timer. A fixed-delay "declare ready regardless" checker would mark a
+	// completely broken device (e.g. handshake never completing) as ready, hiding the failure
+	// from the monitoring system instead of surfacing it.
+	for i := 0; i < 30; i++ {
 		select {
 		case <-w.ctx.Done():
 			return
 		case <-time.After(time.Second):
+		}
+		ctx, cancel := context.WithTimeout(w.ctx, time.Second*5)
+		res, err := urltest.URLTest(ctx, "https://1.1.1.1", w)
+		cancel()
+		if res > 0 && res < 20000 && err == nil {
+			w.started = true
+			monitoring.Get(w.ctx).TestNow(w.Tag())
+			return
 		}
 	}
 }
