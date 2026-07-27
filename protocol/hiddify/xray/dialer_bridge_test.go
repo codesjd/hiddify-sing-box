@@ -5,7 +5,6 @@ import (
 	"io"
 	"net"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -20,13 +19,12 @@ import (
 )
 
 // resetInstallOutboundInterfaceExclusionOnceForTest lets each test observe its own fresh
-// installOutboundInterfaceExclusion invocation - the real function is guarded by a process-wide
-// sync.Once (deliberately: xray-core's dialer controller list is itself a process-wide singleton,
-// see dialer_bridge.go), which every other test in this package constructing an Outbound via New()
-// also exercises and consumes.
+// installOutboundInterfaceExclusion invocation - xray-core's dialer controller list is itself a
+// process-wide singleton (see dialer_bridge.go), and every other test in this package constructing
+// an Outbound via New() also exercises and consumes the "already installed" latch.
 func resetInstallOutboundInterfaceExclusionOnceForTest(t *testing.T) {
 	t.Helper()
-	installOutboundInterfaceExclusionOnce = sync.Once{}
+	installOutboundInterfaceExclusionDone.Store(false)
 }
 
 // fakeNetworkManager stubs adapter.NetworkManager, overriding only what
@@ -117,4 +115,35 @@ func TestInstallOutboundInterfaceExclusionAppliesRealDial(t *testing.T) {
 func TestInstallOutboundInterfaceExclusionNoopsWithoutNetworkManager(t *testing.T) {
 	resetInstallOutboundInterfaceExclusionOnceForTest(t)
 	installOutboundInterfaceExclusion(context.Background(), boxlog.NewNOPFactory().Logger())
+}
+
+// TestInstallOutboundInterfaceExclusionRetriesAfterAnEmptyFirstCall guards a real regression: this
+// used to be gated by a sync.Once, so if the very first "xray" outbound ever constructed in the
+// process raced ahead of box.go registering adapter.NetworkManager in context (plausible on a more
+// involved startup path like TUN mode, which has more services to initialize before the router is
+// fully configured, versus a plain proxy-mode config's minimal socks/http listener), that one
+// unlucky empty call would permanently disable the exclusion for the rest of the process's life -
+// every later "xray" outbound, including ones built well after the NetworkManager is fully ready,
+// reconnects, and profile switches, would silently reproduce the tun-loopback hang forever. A
+// context with no NetworkManager (matching the real "raced ahead of registration" case) must not
+// prevent a later call, with a real one, from actually installing the exclusion.
+func TestInstallOutboundInterfaceExclusionRetriesAfterAnEmptyFirstCall(t *testing.T) {
+	resetInstallOutboundInterfaceExclusionOnceForTest(t)
+	logger := boxlog.NewNOPFactory().Logger()
+
+	// First call: no NetworkManager in context at all, exactly like an outbound racing ahead of
+	// box startup - this must not be treated as a final answer.
+	installOutboundInterfaceExclusion(context.Background(), logger)
+	if installOutboundInterfaceExclusionDone.Load() {
+		t.Fatalf("an empty first call (no NetworkManager) must not mark the exclusion as installed")
+	}
+
+	// Second call: NetworkManager is now available, as it would be once box startup actually
+	// finishes - this must succeed rather than being permanently skipped by the first call.
+	fakeNM := &fakeNetworkManager{}
+	ctx := service.ContextWith[adapter.NetworkManager](context.Background(), fakeNM)
+	installOutboundInterfaceExclusion(ctx, logger)
+	if !installOutboundInterfaceExclusionDone.Load() {
+		t.Fatalf("expected the second call (with a real NetworkManager) to install the exclusion - regression: an earlier empty call permanently disabled all future attempts")
+	}
 }
