@@ -218,6 +218,15 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 			return VerifyPublicKeySHA256(options.CertificatePublicKeySHA256, rawCerts)
 		}
 	}
+	if len(options.PinnedPeerCertificateSha256) > 0 { //H
+		if len(options.Certificate) > 0 || options.CertificatePath != "" {
+			return nil, E.New("pinned_peer_certificate_sha256 is conflict with certificate or certificate_path")
+		}
+		tlsConfig.InsecureSkipVerify = true
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			return VerifyPinnedCertificateSha256(options.PinnedPeerCertificateSha256, rawCerts)
+		}
+	}
 	if len(options.ALPN) > 0 {
 		tlsConfig.NextProtos = options.ALPN
 	}

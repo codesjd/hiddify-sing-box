@@ -22,5 +22,10 @@ func NewRemoteDialer(ctx context.Context, options option.RemoteDNSServerOptions)
 		Options:        options.DialerOptions,
 		RemoteIsDomain: options.ServerIsDomain(),
 		DirectResolver: true,
+		// DNS server detours commonly point at a caller-chosen fallback tag that's expected to
+		// resolve to a plain direct outbound when the corresponding feature isn't configured
+		// (e.g. hiddify's WARP-off passthrough) - that's an intentional no-op, not the kind of
+		// outbound-routing misconfiguration NewDetour's empty-direct check exists to catch.
+		DisableEmptyDirectCheck: true,
 	})
 }

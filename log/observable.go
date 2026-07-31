@@ -9,7 +9,6 @@ import (
 	"github.com/sagernet/sing/common"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/observable"
-	"github.com/sagernet/sing/service/filemanager"
 )
 
 var _ Factory = (*defaultFactory)(nil)
@@ -19,7 +18,7 @@ type defaultFactory struct {
 	formatter         Formatter
 	platformFormatter Formatter
 	writer            io.Writer
-	file              *os.File
+	fileWriter        *rotatingFileWriter
 	filePath          string
 	platformWriter    PlatformWriter
 	needObservable    bool
@@ -61,19 +60,19 @@ func NewDefaultFactory(
 
 func (f *defaultFactory) Start() error {
 	if f.filePath != "" {
-		logFile, err := filemanager.OpenFile(f.ctx, f.filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		logFile, err := newRotatingFileWriter(f.ctx, f.filePath)
 		if err != nil {
 			return err
 		}
 		f.writer = logFile
-		f.file = logFile
+		f.fileWriter = logFile
 	}
 	return nil
 }
 
 func (f *defaultFactory) Close() error {
 	return common.Close(
-		common.PtrOrNil(f.file),
+		common.PtrOrNil(f.fileWriter),
 		f.subscriber,
 	)
 }

@@ -719,7 +719,7 @@ func (r *Router) actionSniff(
 			metadata.SniffError = err
 			if errors.Is(err, sniff.ErrNeedMoreData) {
 				// TODO: replace with generic message when there are more multi-packet protocols
-				r.logger.DebugContext(ctx, "attempt to sniff fragmented QUIC client hello")
+				r.logger.TraceContext(ctx, "attempt to sniff fragmented QUIC client hello")
 				continue
 			}
 			goto finally
@@ -779,7 +779,7 @@ func (r *Router) actionSniff(
 				metadata.SniffError = err
 				if errors.Is(err, sniff.ErrNeedMoreData) {
 					// TODO: replace with generic message when there are more multi-packet protocols
-					r.logger.DebugContext(ctx, "attempt to sniff fragmented QUIC client hello")
+					r.logger.TraceContext(ctx, "attempt to sniff fragmented QUIC client hello")
 					continue
 				}
 			}

@@ -91,6 +91,13 @@ func (d *Device) Close() error {
 	return nil
 }
 
+// Started reports whether Start has actually initialized the underlying wireguard device
+// (built the device, applied the IPC config, and brought the tun up). Exists so callers embedding
+// Device can be regression-tested against silently never delegating to Start.
+func (d *Device) Started() bool {
+	return d.awgDevice != nil
+}
+
 func (d *Device) DialContext(ctx context.Context, network string, destination metadata.Socksaddr) (net.Conn, error) {
 	return d.tun.DialContext(ctx, network, destination)
 }

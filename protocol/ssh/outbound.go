@@ -187,8 +187,55 @@ func (s *Outbound) connect() (*ssh.Client, error) {
 		s.clientConn = nil
 		s.clientAccess.Unlock()
 	}()
+	go s.keepAlive(client, sshKeepaliveInterval, sshKeepaliveTimeout)
 
 	return client, nil
+}
+
+const (
+	sshKeepaliveInterval = 30 * time.Second
+	sshKeepaliveTimeout  = 10 * time.Second
+)
+
+// keepAlive periodically probes the underlying SSH connection with a keepalive@openssh.com global
+// request and closes it if no reply arrives in time. Without this, a NAT or firewall silently
+// dropping the single, long-lived TCP connection this outbound multiplexes every proxied channel
+// over goes undetected: x/crypto/ssh's channel conns have never supported SetReadDeadline (see
+// chanConn.SetReadDeadline in x/crypto/ssh/tcpip.go, which unconditionally returns an error), so a
+// caller reading from a channel on a connection that died silently just hangs instead of failing,
+// and the same already-dead connection keeps getting handed out to every new dial until something
+// notices. That is what "the SSH proxy works but latency/ping is wildly inconsistent" looks like in
+// practice - fine while the connection is healthy, then a dial or read stalls for a long time
+// against a connection that is actually already gone. Closing the client here makes the existing
+// client.Wait() cleanup goroutine above reset s.client/s.clientConn, so the next connect() call
+// transparently redials instead of reusing a dead connection.
+func (s *Outbound) keepAlive(client *ssh.Client, interval, timeout time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		replied := make(chan bool, 1)
+		go func() {
+			_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+			replied <- err == nil
+		}()
+		select {
+		case ok := <-replied:
+			if !ok {
+				client.Close()
+				return
+			}
+		case <-time.After(timeout):
+			client.Close()
+			return
+		case <-s.ctx.Done():
+			return
+		}
+	}
 }
 
 func (s *Outbound) PostStart() error {
@@ -280,5 +327,5 @@ func (s *Outbound) ProxyDisplayName() string {
 			str += " ⚠️ Connecting..."
 		}
 	}
-	return s.connectionErr
+	return str
 }

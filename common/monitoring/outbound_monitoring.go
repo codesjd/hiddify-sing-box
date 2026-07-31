@@ -40,6 +40,15 @@ const (
 	defaultIdleTimeout    = 10 * time.Minute
 	defaultInterval       = 5 * time.Minute
 	defaultURLTest        = "https://www.gstatic.com/generate_204"
+
+	// defaultCycleCooldown bounds how often InterfaceUpdated can kick off a brand-new full
+	// monitoring cycle (every outbound x every fallback test URL). On a flapping connection,
+	// network-change notifications can fire many times per second; without a cooldown each one
+	// starts a fresh full cycle the moment the previous one finishes, producing a near-continuous
+	// back-to-back scan that has been observed to generate tens of thousands of dial attempts
+	// against the same server in minutes. This does not skip requested rescans, it coalesces
+	// rapid-fire ones into at most one per cooldown window.
+	defaultCycleCooldown = 5 * time.Second
 )
 
 // func RegisterService(registry *boxService.Registry) {
@@ -73,6 +82,7 @@ type OutboundMonitoring struct {
 	mainInterval     time.Duration
 	debounceWindow   time.Duration
 	urlTestTimeout   time.Duration
+	cycleCooldown    time.Duration
 	workersCount     int
 	history          adapter.URLTestHistoryStorage
 
@@ -88,13 +98,17 @@ type OutboundMonitoring struct {
 
 	cycleSeq     uint64
 	cycleRunning atomic.Bool
+	cyclePending atomic.Bool
+	lastCycleAt  common.TypedValue[time.Time]
 
 	workerWG    sync.WaitGroup
 	schedulerWG sync.WaitGroup
 	closerOnce  sync.Once
 }
 
-// InterfaceUpdated implements [adapter.InterfaceUpdateListener].
+// InterfaceUpdated implements [adapter.InterfaceUpdateListener]. On a flapping network this can
+// fire many times in quick succession; startCycleOnce coalesces those into at most one full cycle
+// per cycleCooldown instead of starting a brand-new full outbound x URL scan for each notification.
 func (m *OutboundMonitoring) InterfaceUpdated() {
 	m.startCycleOnce()
 }
@@ -248,6 +262,7 @@ func NewOutboundMonitoring(ctx context.Context, logger log.ContextLogger, option
 		workersCount:   options.Workers,
 		urlTestTimeout: options.URLTestTimeout.Build(),
 		debounceWindow: options.DebounceWindow.Build(),
+		cycleCooldown:  defaultCycleCooldown,
 
 		priorityQueue: make(chan *testTask, 1000),
 		normalQueue:   make(chan *testTask, 10000),
@@ -623,10 +638,29 @@ func (m *OutboundMonitoring) tester(parent context.Context, tag string) (adapter
 
 func (m *OutboundMonitoring) startCycleOnce() bool {
 	if !m.cycleRunning.CompareAndSwap(false, true) {
+		// A cycle is already running (or a cooldown wait is already scheduled below) - remember
+		// that another one was requested instead of dropping it, so it still runs once the current
+		// one (and its cooldown) settles, but rapid repeated callers (e.g. a flapping network
+		// interface firing InterfaceUpdated many times a second) coalesce into a single pending
+		// rescan instead of each queuing up their own full cycle.
+		m.cyclePending.Store(true)
 		return false
 	}
+	if since := time.Since(m.lastCycleAt.Load()); since < m.cycleCooldown {
+		time.AfterFunc(m.cycleCooldown-since, func() {
+			m.cycleRunning.Store(false)
+			m.startCycleOnce()
+		})
+		return true
+	}
 	go func() {
-		defer m.cycleRunning.Store(false)
+		defer func() {
+			m.lastCycleAt.Store(time.Now())
+			m.cycleRunning.Store(false)
+			if m.cyclePending.Swap(false) {
+				m.startCycleOnce()
+			}
+		}()
 		m.logger.Info("starting regular outbound monitoring cycle")
 		m.runCycle()
 	}()
